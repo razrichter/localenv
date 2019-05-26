@@ -1,0 +1,63 @@
+#!/bin/sh
+# -*- mode: sh; -*-
+# vim: set filetype=sh :
+# set -u # no uninitialized
+# set -e # exit on error ( use "|| true" or wrap in "set +e" "set -e" to block )
+# set -o pipefail # also exit if error in piped command -- must disable for acceptable errors
+# IFS=$(printf '\n\t') # spaces don't split items
+bindir=$(cd $(dirname "$0") && pwd)
+arch=$(uname -m)
+os=$(uname -s)
+if [ "$os" = "Darwin" ]; then
+    os=MacOSX
+fi
+anaconda_installer_url="https://repo.continuum.io/miniconda/Miniconda3-latest-${os}-${arch}.sh"
+perlbrew_installer_url='https://install.perlbrew.pl'
+
+usage () {
+    cat <<_USAGE
+localenv-bootstrap - creates a localenv root tree with installed anaconda and perlbrew
+Usage:  localenv-bootstrap [<localenv_root_dir>]
+By default, installs into \$PWD/localenv
+Requires internet access to download anaconda and perlbrew
+_USAGE
+}
+
+onexit () {
+    : # necessary cleanup steps
+}
+trap onexit EXIT
+
+main() {
+    # option parsing
+    while getopts "h" opt; do
+        case $opt in
+            h)
+                usage >&2
+                exit 0
+            ;;
+        esac
+    done
+    shift $((OPTIND-1))
+
+    # create localenv directories
+    local root_dir=${1:-"$PWD/localenv"}     # by default, install to current directory
+    if [ ! -d "$root_dir" ]; then
+        mkdir -p "$root_dir"
+    fi
+    mkdir -p "$root_dir/bin" "$root_dir/envs"
+    cp "$bindir/localenv"* "$root_dir/bin"
+
+    # anaconda
+    wget -O anaconda-install.sh "$anaconda_installer_url" && bash ./anaconda-install.sh -b -p $root_dir/anaconda && rm anaconda-install.sh
+
+    # perlbrew
+    export PERLBREW_ROOT="$root_dir/perlbrew"
+    export PERLBREW_HOME=$PERLBREW_ROOT
+    wget -O perlbrew-install "$perlbrew_installer_url" && bash perlbrew-install && rm perlbrew-install
+    . $PERLBREW_ROOT/etc/bashrc
+    perlver="$(perlbrew available | fgrep ' perl-5' | sort -t . -k2,2nr | awk -F . '($2 % 2) == 0 { print; exit }')"
+    perlbrew install --force --notest $perlver  # TODO figure out what/how to install newest stable
+}
+
+main "$@"

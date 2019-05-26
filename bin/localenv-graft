@@ -1,0 +1,1547 @@
+#!/usr/local/bin/perl -w
+
+
+#
+# Virtual package installer.
+#
+# Author: Peter Samuel, Gormand Pty Ltd <peters@gormand.com.au>
+
+###########################################################################
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published
+# by the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA, or download it
+# from the Free Software Foundation's web site:
+#
+#	http://www.gnu.org/copyleft/gpl.html
+#	http://www.gnu.org/copyleft/gpl.txt
+#
+
+## Modified to be localenv aware - razr
+
+###########################################################################
+#
+# System defaults
+
+require 5;				# uses perl 5 exclusively
+use strict;				# force good coding practise
+use File::Basename;			# provides basename() and dirname()
+use Getopt::Std;			# standard getopts module
+
+use FindBin qw//;
+use File::Basename qw/dirname/;
+our $BINDIR;
+BEGIN {
+    $BINDIR = $FindBin::Bin;
+}
+
+$| = 1;					# flush after every write
+
+# Get the RCS revision number. If the file has been checked out for
+# editing, add "+" to the revision number to indicate its state. The
+# revision number is written to the log file for every graft operation.
+# This is only used for testing new development versions.
+
+my $LOCALENV_ROOT = $ENV{LOCALENV_ROOT} || dirname($BINDIR);
+my $packageDefault = "$LOCALENV_ROOT/packages";
+
+my $logfile;
+my $target;
+if ($ENV{LOCALENV_ACTIVE}) {
+    my $env = "$LOCALENV_ROOT/envs/$ENV{LOCALENV_ACTIVE}";
+    $logfile = "$env/var/log/graft";
+    $target = $env;
+}
+else {
+    $logfile = "$LOCALENV_ROOT/var/log/graft";
+    $target = "$LOCALENV_ROOT/envs/_root/";
+}
+my $targetTop = $target;      
+
+my @rcsid = split(' ',
+    '$Id: graft.pl,v 2.4.1 2017/02/06 20:43:20 razr Exp $');
+
+my $version = $rcsid[2];
+$version .= "+" if (scalar @rcsid == 9);
+
+my $progname = basename $0;		# this program's name
+my $exitOnConflict = 1;			# exit on conflicts - install only
+
+# Are superuser privileges required?
+my $superuser = "0";
+
+# Preserve directory permissions on newly created directories?
+# Only if SUPERUSER is set to 1 in the Makefile.
+my $preservePermissions = "0";
+$preservePermissions = 0 unless $superuser;
+
+# Remove empty directories after an ungraft and remove conflicting
+# objects discovered during a prune?
+my $deleteObjects = "0";
+
+
+# names of special graft control files
+my $graftIgnore = ".nograft";
+my $graftExclude = ".graft-exclude";
+my $graftInclude = ".graft-include";
+
+# List of files and/or directories graft may never examine.
+# Usage depends on the value of $neverGraft.
+my @graftNever = qw ( 1 );
+my %graftNever;
+
+# Should graft always ignore files and/or directories
+# specified by @graftNever?
+my $neverGraft = "0";
+
+
+
+# pruned file suffix
+my $prunedSuffix = ".pruned";
+
+# Verbosity is zero for the moment. Set by user with -v or -V options.
+my $verbose = 0;
+my $veryVerbose = 0;
+
+###########################################################################
+#
+# Argument parsing
+
+# The following initialisations are necessary to avoid -w complaints about
+# uninitialised variables if user does not supply all possible options.
+
+$Getopt::Std::opt_C = 0;		# don't exclude files in @graftNever
+$Getopt::Std::opt_D = 0;		# remove empty/conflicting files/dirs
+$Getopt::Std::opt_d = 0;		# delete pkgs
+$Getopt::Std::opt_i = 0;		# install pkgs
+$Getopt::Std::opt_l = 0;		# user supplied log file name
+$Getopt::Std::opt_n = 0;		# print actions but don't do them
+$Getopt::Std::opt_p = 0;		# prune conflicting files
+$Getopt::Std::opt_s = 0;		# Stow/Depot compatibility mode
+$Getopt::Std::opt_t = 0;		# package target
+$Getopt::Std::opt_V = 0;		# very verbose
+$Getopt::Std::opt_v = 0;		# verbose
+
+if ($superuser)
+{
+    $Getopt::Std::opt_P = 0;		# preserve directory permissions
+    $Getopt::Std::opt_u = 0;		# disable superuser privileges
+
+    if (&getopts('CDdil:nPpst:uVv') eq "")
+    {
+	usage();
+    }
+}
+else
+{
+    if (&getopts('CDdil:npst:Vv') eq "")
+    {
+	usage();
+    }
+}
+
+usage() unless
+    $Getopt::Std::opt_i			# User must supply one of these options
+    ||
+    $Getopt::Std::opt_d
+    ||
+    $Getopt::Std::opt_p;
+
+# Options -d, -i and -p are mutually exclusive
+
+usage() if
+    ($Getopt::Std::opt_d && $Getopt::Std::opt_i)
+    ||
+    ($Getopt::Std::opt_d && $Getopt::Std::opt_p)
+    ||
+    ($Getopt::Std::opt_i && $Getopt::Std::opt_p);
+
+if ($superuser)
+{
+    usage() if
+	$Getopt::Std::opt_P		# -P is only useful with -i
+	&&
+	(
+	    $Getopt::Std::opt_d
+	    ||
+	    $Getopt::Std::opt_p
+	);
+
+    usage() if				# -P and -u are mutally exclusive
+	$Getopt::Std::opt_P
+	&&
+	$Getopt::Std::opt_u;
+}
+
+usage() if
+    $Getopt::Std::opt_C			# -C is only useful with -i
+    &&
+	(
+	    $Getopt::Std::opt_d
+	    ||
+	    $Getopt::Std::opt_p
+	);
+
+usage() if
+    $Getopt::Std::opt_D			# -D is only useful with -d or -p
+    &&
+    $Getopt::Std::opt_i;
+
+usage() if
+    $Getopt::Std::opt_s			# -s and -t are mutually exclusive
+    &&
+    $Getopt::Std::opt_t;
+
+###########################################################################
+#
+# Argument processing
+
+if ($Getopt::Std::opt_l)
+{
+    # Logfile name must be fully qualified and the directory in which
+    # it lives must exist.
+
+    $logfile = $Getopt::Std::opt_l;	# User supplied log file name
+
+    unless (fullyqualified($logfile))
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Log file $logfile is not fully qualified.",
+	    );
+
+	usage();
+    }
+
+    my $dir = dirname $logfile;
+
+    unless (-d $dir)
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Cannot create log file $logfile. No such"
+			   . " directory as $dir.",
+	    );
+
+	usage();
+    }
+
+    undef $dir;
+}
+
+if ($Getopt::Std::opt_n)
+{
+    ++$verbose;				# -n implies very verbose
+    ++$veryVerbose;
+    $exitOnConflict = 0;		# no need to exit on conflicts
+}
+else
+{
+    # How verbose is verbose?
+
+    ++$verbose if ($Getopt::Std::opt_v || $Getopt::Std::opt_V);
+    ++$veryVerbose if $Getopt::Std::opt_V;
+}
+
+if ($Getopt::Std::opt_t)
+{
+    # Target directory must be fully qualified and it must also exist
+
+    $target = $Getopt::Std::opt_t;
+    $targetTop = $target;
+
+    unless (fullyqualified($target))
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Target directory $target is not fully qualified.",
+	    );
+
+	usage();
+    }
+
+    unless (-d $target)
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Target directory $target does not exist.",
+	    );
+
+	usage();
+    }
+}
+
+usage() unless scalar @ARGV;		# Need package arguments
+
+# We do the toggles last. Otherwise the command line arguments would
+# affect the usage message which could confuse the punters.
+
+if ($Getopt::Std::opt_C)		# Toggle never graft flag
+{
+    if ($neverGraft)
+    {
+	$neverGraft = 0;		# Was set to 1 in Makefile
+    }
+    else
+    {
+	$neverGraft = 1;		# Was set to 0 in Makefile
+    }
+}
+
+if ($neverGraft)
+{
+    foreach (@graftNever)		# Coerce @graftNever into a hash.
+    {
+	++$graftNever{$_};
+    }
+}
+
+if ($Getopt::Std::opt_D)		# Toggle delete directories flag
+{
+    if ($deleteObjects)
+    {
+	$deleteObjects = 0;		# Was set to 1 in Makefile
+    }
+    else
+    {
+	$deleteObjects = 1;		# Was set to 0 in Makefile
+    }
+}
+
+if ($superuser)
+{
+    if ($Getopt::Std::opt_P)		# Toggle preserve permissions flag
+    {
+	if ($preservePermissions)
+	{
+	    $preservePermissions = 0;	# Was set to 1 in Makefile
+	}
+	else
+	{
+	    $preservePermissions = 1;	# Was set to 0 in Makefile
+	}
+    }
+}
+
+# Disable superuser privileges if superuser was set to 1 in Makefile
+# and user specified -u on the command line.
+$superuser = 0 if ($Getopt::Std::opt_u && $superuser);
+
+if ($superuser)
+{
+    # Everything beyond this point requires superuser
+    # privileges unless -n or -u was specified on the command line.
+
+    die "Sorry, only the superuser can install or delete packages.\n"
+	unless $> == 0 or $Getopt::Std::opt_n;
+}
+
+# If everything succeeds, then exit with status 0. If a CONFLICT
+# arises, then exit with status 1. If the user supplied invalid command
+# line arguments the program has already exited with status 2. If one
+# or more packages does not exist then exit with status 3.
+
+my $errorStatus = 0;			# Set default exit status
+
+# Die now if the OS does not support symbolic links!
+
+(eval 'symlink "", "";', $@ eq '')
+    or die "Your operating system does not support symbolic links.\n";
+
+###########################################################################
+#
+# Process each package provided on the command line
+
+foreach my $package (@ARGV)
+{
+    $package = stripslashes($package);
+
+    # If the package is not fully qualified, prepend it with the
+    # default package target.
+
+    unless (fullyqualified($package))
+    {
+	$package = $packageDefault . "/" . $package;
+    }
+
+    # Complain if the package directory does not exist.
+
+    unless (-d $package)
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Package directory $package does not exist.",
+	    );
+
+	$errorStatus = 3;
+	next;
+    }
+
+    if ($Getopt::Std::opt_s)
+    {
+	# Stow/Depot compatibility mode. Stow and Depot (in their
+	# default modes) assume that packages are installed in
+	# /dir/stow/pkg-nn or /dir/depot/pkg-nn. They also assume the
+	# symbolic links will be created in /dir. Graft's Stow/Depot
+	# compatibility mode takes a single argument as the
+	# installation directory of the package and grafts it into the
+	# directory which is the dirname of the dirname of the
+	# argument. (That's not a typo! That really _is_ two lots of
+	# dirname operations).
+
+	$target = dirname dirname $package;
+    }
+
+    if ($Getopt::Std::opt_i)
+    {
+	message(
+		tag	=> "Installing",
+		msg	=> "links to $package in $target"
+	    ) if $verbose;
+
+	logger(
+		tag	=> "I",
+		log	=> [ $package, $target ],
+	    ) unless $Getopt::Std::opt_n;
+
+	install(
+		source	=> $package,
+		target	=> $target,
+	    );
+    }
+
+    if ($Getopt::Std::opt_d)
+    {
+	message(
+		tag	=> "Uninstalling",
+		msg	=> "links from $target to $package",
+	    ) if $verbose;
+
+	logger(
+		tag	=> "D",
+		log	=> [ $package, $target ],
+	    ) unless $Getopt::Std::opt_n;
+
+	uninstall(
+		source	=> $package,
+		target	=> $target,
+	    );
+    }
+
+    if ($Getopt::Std::opt_p)
+    {
+	message(
+		tag	=> "Pruning",
+		msg	=> "files in $target which conflict with $package",
+	    ) if $verbose;
+
+	# Pruning is a special case of deletion
+
+	logger(
+		tag	=> "P",
+		log	=> [ $package, $target ],
+	    ) unless $Getopt::Std::opt_n;
+
+	uninstall(
+		source	=> $package,
+		target	=> $target,
+	    );
+    }
+}
+
+exit $errorStatus;
+
+###########################################################################
+
+sub cat
+{
+    # Open the named file and return a hash of the lines in the file.
+    # Duplicate entries are handled automatically by the hash.
+
+    my $file = shift;
+    my %hash;
+
+    if (defined open FILE, $file)
+    {
+	while (<FILE>)
+	{
+	    chomp;
+	    ++$hash{$_};
+	}
+
+	close FILE;
+	return %hash;
+    }
+    else
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Could not open $file for reading: $!."
+	    );
+
+	return undef;
+    }
+}
+
+sub directories
+{
+    # Return a hash of directories beneath the current directory.
+    # The special directories "." and ".." will not be returned.
+    # Symbolic links to directories will be treated as links and
+    # NOT as directories.
+
+    my $cwd = shift;
+    my %dirs;
+
+    if (opendir DOT, ".")
+    {
+	foreach (readdir DOT)
+	{
+	    next if /^\.\.?$/;		# ignore "." and ".."
+	    next unless -d;		# ignore non directories
+	    next if -l;			# ignore symbolic links to directories
+	    ++$dirs{$_};
+	}
+
+	closedir DOT;
+	return %dirs;
+    }
+    else
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Could not open directory $cwd for reading: $!"
+	    );
+
+	return undef;
+    }
+}
+
+sub files
+{
+    # Return a hash of non directories beneath the current directory.
+    # Symbolic links to directories will also be returned.
+
+    my $cwd = shift;
+    my %files;
+
+    if (opendir DOT, ".")
+    {
+	foreach (readdir DOT)
+	{
+	    next if -d && ! -l;		# ignore real directories,
+	    				# symlinks to directories are OK.
+	    ++$files{$_};
+	}
+
+	closedir DOT;
+	return %files;
+    }
+    else
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Could not open directory $cwd for reading: $!",
+	    );
+
+	return undef;
+    }
+}
+
+sub fullyqualified
+{
+    # return true if the argument is a fully qualified directory name
+
+    my $string = shift;
+
+    return $string =~ /^\// ? 1 : 0;
+}
+
+sub install
+{
+    # For each directory in $source, create a directory in $target.
+    # For each file in $source, create a symbolic link from $target.
+
+    my %arg = @_;
+
+    my $source = $arg{source};
+    my $target = $arg{target};
+
+    unless (chdir $source)
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Could not change directories to $source: $!",
+	    );
+
+	return;
+    }
+
+    message(
+	    tag	=> "Processing",
+	    msg	=> "$source",
+	) if $verbose;
+
+    # get a list of files and directories in this directory
+
+    my %files;
+    %files = files($source);
+
+    my %directories;
+    %directories = directories($source);
+
+    # Don't process this directory if an ignore file exists
+
+    if (exists $files{$graftIgnore})
+    {
+	message(
+		tag	=> "BYPASS",
+		msg	=> "$source - $graftIgnore file found",
+	    ) if $veryVerbose;
+
+	return;
+    }
+
+    # If an include file exists, its contents should be a list of files
+    # and/or directories to exclusively include in the graft.
+
+    my %includes;
+    my $exclusiveInclude = 0;
+
+    if (exists $files{$graftInclude})
+    {
+	%includes = cat($graftInclude);
+	++$exclusiveInclude;
+
+	message(
+		tag	=> "READING",
+		msg	=> "include file $source/$graftInclude",
+	    ) if $veryVerbose;
+
+	delete $files{$graftInclude};
+    }
+
+    # If an exclude file exists, its contents should be a list of files
+    # and/or directories to exclude from the graft. This takes
+    # precedence over any included files.
+
+    my %excludes;
+    my $exclusiveExclude = 0;
+
+    if (exists $files{$graftExclude})
+    {
+	%excludes = cat($graftExclude);
+	++$exclusiveExclude;
+
+	message(
+		tag	=> "READING",
+		msg	=> "exclude file $source/$graftExclude",
+	    ) if $veryVerbose;
+
+	delete $files{$graftExclude};
+
+	# Explicit exclusion takes precedence over explicit inclusion
+
+	if ($exclusiveInclude)
+	{
+	    $exclusiveInclude = 0;
+
+	    message(
+		    tag	=> "IGNORE",
+		    msg => "include file $source/$graftInclude, overridden"
+			   . " by exclude file $source/$graftExclude"
+		) if $veryVerbose;
+	}
+    }
+
+    foreach my $file (sort keys %files)
+    {
+	if ($exclusiveInclude)
+	{
+	    if (exists $includes{$file})
+	    {
+		message(
+			tag	=> "INCLUDE",
+			msg	=> "file $source/$file - listed in"
+				   . " $source/$graftInclude",
+		    ) if $veryVerbose;
+	    }
+	    else
+	    {
+		message(
+			tag	=> "IGNORE",
+			msg	=> "file $source/$file - not listed in"
+				   . " $source/$graftInclude",
+		    ) if $veryVerbose;
+
+		next;
+	    }
+	}
+
+	if (exists $excludes{$file})
+	{
+	    message(
+		    tag	=> "EXCLUDE",
+		    msg	=> "file $source/$file - listed in"
+			   . " $source/$graftExclude",
+		) if $veryVerbose;
+
+	    next;
+	}
+
+	if (exists $graftNever{$file})
+	{
+	    message(
+		    tag	=> "EXCLUDE",
+		    msg	=> "file $source/$file will never be grafted",
+		) if $veryVerbose;
+
+	    next;
+	}
+
+	if (-l "$target/$file")
+	{
+	    # Target file exists and is a symlink. If it is a symlink
+	    # to the source file it can be ignored. Having this test
+	    # first avoids any problems later where the target may be a
+	    # symlink to the package file which is in turn a symlink to
+	    # a non existent file. A -e test in this case fails as it
+	    # uses stat() which will traverse the link(s).
+
+	    my $link = readlink "$target/$file";
+
+	    if ("$source/$file" eq $link)
+	    {
+		message(
+			tag	=> "NOP",
+			msg	=> "$target/$file already linked to"
+				   . " $source/$file",
+		    ) if $veryVerbose;
+	    }
+	    else
+	    {
+		message(
+			tag	=> "CONFLICT",
+			msg	=> "$target/$file is linked to something"
+				   . " other than $source/$file"
+				   . " ($target/$file -> $link)",
+		    );
+
+		logger(
+			tag	=> "IC",
+			log	=> [ "$target/$file", "invalid symlink" ],
+		    ) unless $Getopt::Std::opt_n;
+
+		exit 1 if $exitOnConflict;
+	    }
+
+	    next;
+	}
+
+	unless (-e "$target/$file")
+	{
+	    # Target file does not exist - so we can safely create
+	    # a symbolic link for the target to the original.
+
+	    message(
+		    tag	=> "SYMLINK",
+		    msg	=> "$target/$file -> $source/$file",
+		) if $veryVerbose;
+
+	    # Make the symbolic link. If -n was specified, don't
+	    # actually create anything, just report the action and move
+	    # to the next file.
+
+	    unless ($Getopt::Std::opt_n)
+	    {
+		symlink "$source/$file", "$target/$file"
+		    or die "Failed to create symbolic link"
+			   . " $target/$file -> $source/$file: $!\n";
+	    }
+
+	    next;
+	}
+
+	message(
+		tag	=> "CONFLICT",
+		msg	=> "$target/$file already exists but is NOT a"
+			   . " symlink to $source/$file",
+	    );
+
+	logger(
+		tag	=> "IC",
+		log	=> [ "$target/$file", "file exists" ],
+	    ) unless $Getopt::Std::opt_n;
+
+	exit 1 if $exitOnConflict;
+    }
+
+    foreach my $dir (sort keys %directories)
+    {
+	if (-f "$source/$dir/$graftIgnore")
+	{
+	    # Explicitly ignore directories with ignore files
+
+	    message(
+		    tag	=> "BYPASS",
+		    msg	=> "$source/$dir - $graftIgnore file found",
+		) if $veryVerbose;
+
+	    next;
+	}
+
+	if ($exclusiveInclude)
+	{
+	    if (exists $includes{$dir})
+	    {
+		message(
+			tag	=> "INCLUDE",
+			msg	=> "directory $source/$dir - listed in"
+				   . " $source/$graftInclude",
+		    ) if $veryVerbose;
+	    }
+	    else
+	    {
+		message(
+			tag	=> "IGNORE",
+			msg	=> "directory $source/$dir - not listed"
+				   . " in $source/$graftInclude",
+		    ) if $veryVerbose;
+		next;
+	    }
+	}
+
+	if (exists $excludes{$dir})
+	{
+	    message(
+		    tag	=> "EXCLUDE",
+		    msg	=> "directory $source/$dir - listed in"
+			   . " $source/$graftExclude",
+		) if $veryVerbose;
+
+	    next;
+	}
+
+	if (exists $graftNever{$dir})
+	{
+	    message(
+		    tag	=> "EXCLUDE",
+		    msg	=> "directory $source/$dir will never be grafted",
+		) if $veryVerbose;
+
+	    next;
+	}
+
+	unless (-e "$target/$dir")
+	{
+	    # Target does not exist - so we can
+	    # safely create the target directory.
+
+	    message(
+		    tag	=> "MKDIR",
+		    msg	=> "$target/$dir",
+		) if $veryVerbose;
+
+	    # Create directory (with the same permissions, owner and
+	    # group as the original if specified by -P). If -n was
+	    # specified, don't actually create anything, just report
+	    # the action and move to the next directory.
+
+	    unless ($Getopt::Std::opt_n)
+	    {
+		if ($preservePermissions && $superuser)
+		{
+		    my $mode;
+		    my $uid;
+		    my $gid;
+
+		    # Only do this if superuser privileges are on.
+		    # Otherwise it's bound to fail.
+
+		    (undef, undef, $mode, undef, $uid, $gid, undef,
+			undef, undef, undef, undef, undef, undef)
+			= stat "$source/$dir";
+
+		    mkdir "$target/$dir", $mode
+			or die "Could not create $target/$dir: $!\n";
+
+		    chown $uid, $gid, "$target/$dir"
+			or die "Could not set ownership on $target/$dir: $!\n";
+		}
+		else
+		{
+		    mkdir "$target/$dir", 0755
+			or die "Could not create $target/$dir: $!\n";
+		}
+	    }
+
+	    # Recursively descend into this
+	    # directory and repeat the process.
+
+	    install(
+		    source	=> "$source/$dir",
+		    target	=> "$target/$dir",
+		);
+
+	    next;
+	}
+
+	if (-d "$target/$dir")
+	{
+	    # Target directory already exists. Recursively
+	    # descend into the sub-directories.
+
+	    message(
+		    tag	=> "NOP",
+		    msg	=> "$source/$dir and $target/$dir are both directories",
+		) if $veryVerbose;
+
+	    install(
+		    source	=> "$source/$dir",
+		    target	=> "$target/$dir",
+		);
+
+	    next;
+	}
+
+	# Target already exists but is NOT a directory - conflict.
+
+	message(
+		tag	=> "CONFLICT",
+		msg	=> "$target/$dir already exists but is NOT"
+			   . " a directory!",
+	    );
+
+	logger(
+		tag	=> "IC",
+		log	=> [ "$target/$dir", "not a directory" ],
+	    ) unless $Getopt::Std::opt_n;
+
+	exit 1 if $exitOnConflict;
+    }
+}
+
+sub logger
+{
+    # Write a message in the log file. Prepend each message with the
+    # system time and program version number.
+
+    my %msg = @_;
+
+    $msg{tag} = sprintf("%s\t%s\t%s", time, $version, $msg{tag});
+
+    if (defined open LOGFILE, ">> $logfile")
+    {
+	print LOGFILE join("\t", $msg{tag}, @{$msg{log}}), "\n";
+	close LOGFILE;
+    }
+    else
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Could not open log file $logfile: $!.",
+	    );
+    }
+}
+
+sub message
+{
+    # Display a message on STDOUT or STDERR
+
+    my %msg = @_;
+
+    my $tagLength = 12;		# Length of longest tag word.
+
+    if (
+	    $msg{tag} eq "CONFLICT"
+	    ||
+	    $msg{tag} eq "ERROR"
+	)
+    {
+	warn
+		sprintf("%-${tagLength}.${tagLength}s ", $msg{tag}),
+		$msg{msg},
+		"\n";
+    }
+    else
+    {
+	print
+		sprintf("%-${tagLength}.${tagLength}s ", $msg{tag}),
+		$msg{msg},
+		"\n";
+    }
+}
+
+sub prune
+{
+    # Move or delete a file or directory
+
+    my $object = shift;
+
+    # Check for symlinks first. A symlink to a directory will pass a -d test.
+
+    if (-l $object)
+    {
+	if ($deleteObjects)
+	{
+	    message(
+		    tag	=> "UNLINK",
+		    msg	=> "$object",
+		) if $veryVerbose;
+
+	    unless ($Getopt::Std::opt_n)
+	    {
+		unlink "$object"
+		    or die "Could not unlink $object: $!\n";
+	    }
+	}
+	else
+	{
+	    message(
+		    tag	=> "RENAME",
+		    msg	=> "$object",
+		) if $veryVerbose;
+
+	    unless ($Getopt::Std::opt_n)
+	    {
+		rename "$object", "${object}${prunedSuffix}"
+		    or die "Could not rename $object to"
+			   . " ${object}${prunedSuffix}: $!\n";
+	    }
+	}
+
+	return;
+    }
+
+    if (-d $object)
+    {
+	if ($deleteObjects)
+	{
+	    if (opendir OBJ, "$object")
+	    {
+		my %files;
+
+		foreach (readdir OBJ)
+		{
+		    next if /^\.\.?$/;		# ignore "." and ".."
+		    ++$files{$_};
+		}
+
+		closedir OBJ;
+
+		if (scalar keys %files)
+		{
+		    message(
+			    tag	=> "ERROR",
+			    msg => "Cannot remove $object/, renaming"
+				   . " instead. Directory not empty",
+			);
+
+		    message(
+			    tag	=> "RENAME",
+			    msg	=> "$object",
+			) if $veryVerbose;
+
+		    unless ($Getopt::Std::opt_n)
+		    {
+			rename "$object", "${object}${prunedSuffix}"
+			    or die "Could not rename $object to"
+				   . " ${object}${prunedSuffix}: $!\n";
+		    }
+		}
+		else
+		{
+		    message(
+			    tag	=> "UNLINK",
+			    msg	=> "$object",
+			) if $veryVerbose;
+
+		    unless ($Getopt::Std::opt_n)
+		    {
+			rmdir "$object"
+			    or die "Could not remove directory $object: $!\n";
+		    }
+		}
+	    }
+	    else
+	    {
+		message(
+			tag	=> "ERROR",
+			msg	=> "Could not open $object/ for reading,"
+				   . " renaming instead: $!",
+		    );
+
+		message(
+			tag	=> "RENAME",
+			msg	=> "$object",
+		    ) if $veryVerbose;
+
+		unless ($Getopt::Std::opt_n)
+		{
+		    rename "$object", "${object}${prunedSuffix}"
+			or die "Could not rename $object to"
+			       . " ${object}${prunedSuffix}: $!\n";
+		}
+	    }
+	}
+	else
+	{
+	    message(
+		    tag	=> "RENAME",
+		    msg	=> "$object",
+		) if $veryVerbose;
+
+	    unless ($Getopt::Std::opt_n)
+	    {
+		rename "$object", "${object}${prunedSuffix}"
+		    or die "Could not rename $object to"
+			   . " ${object}${prunedSuffix}: $!\n";
+	    }
+	}
+
+	return;
+    }
+
+    # Anything beyond here is neither a symlink nor a directory
+
+    if ($deleteObjects)
+    {
+	message(
+		tag	=> "UNLINK",
+		msg	=> "$object",
+	    ) if $veryVerbose;
+
+	unless ($Getopt::Std::opt_n)
+	{
+	    unlink "$object"
+		or die "Could not unlink $object: $!\n";
+	}
+    }
+    else
+    {
+	message(
+		tag	=> "RENAME",
+		msg	=> "$object",
+	    ) if $veryVerbose;
+
+	unless ($Getopt::Std::opt_n)
+	{
+	    rename "$object", "${object}${prunedSuffix}"
+		or die "Could not rename $object to"
+		       . " ${object}${prunedSuffix}: $!\n";
+	}
+    }
+}
+
+sub stripslashes
+{
+    # Strip trailing slashes and whitespace from user supplied package
+    # names. Some shells will put a trailing slash onto directory names
+    # when using file completion - Bash for example.
+    #
+    # Also, Perl's builtin File::Basename::basename() will return an
+    # empty string for a slash terminated directory, unlike the command
+    # line version which returns the last directory component.
+
+    my $string = shift;
+
+    $string =~ s/\/*\s*$//;
+    return $string;
+}
+
+sub uninstall
+{
+    # For each file in $source, remove the corresponding symbolic link
+    # from $target. Directories may be deleted depending on the status
+    # of $deleteObjects. If the -p option was used instead of -d then
+    # prune conflicting files from the target rather than delete
+    # previously grafted links.
+
+    my %arg = @_;
+
+    my $source = $arg{source};
+    my $target = $arg{target};
+
+    unless (chdir $source)
+    {
+	message(
+		tag	=> "ERROR",
+		msg	=> "Could not change directories to $source: $!",
+	    );
+
+	return;
+    }
+
+    message(
+	    tag	=> "Processing",
+	    msg	=> "$source",
+	) if $verbose;
+
+    # get a list of files and directories in this directory
+
+    my %files;
+    %files = files($source);
+
+    my %directories;
+    %directories = directories($source);
+
+    # Ignore any control files
+
+    delete $files{$graftIgnore};
+    delete $files{$graftInclude};
+    delete $files{$graftExclude};
+
+    foreach my $file (keys %files)
+    {
+	if (-l "$target/$file")
+	{
+	    # Target file exists and is a symlink. If it is a symlink
+	    # to the source file it can be ignored. Having this test
+	    # first avoids any problems later where the target may be a
+	    # symlink to the package file which is in turn a symlink to
+	    # a non existent file. A -e test in this case fails as it
+	    # uses stat() which will traverse the link(s).
+
+	    my $link = readlink "$target/$file";
+
+	    if ("$source/$file" eq $link)
+	    {
+		unless ($Getopt::Std::opt_p)
+		{
+		    # If -n was specified, don't actually remove anything,
+		    # just report the action and move to the next file.
+
+		    message(
+			    tag	=> "UNLINK",
+			    msg	=> "$target/$file",
+			) if $veryVerbose;
+
+		    unless ($Getopt::Std::opt_n)
+		    {
+			unlink "$target/$file"
+			    or message(
+				    tag	=> "ERROR",
+				    msg	=> "Could not unlink $target/$file: $!",
+				);
+		    }
+		}
+
+		next;
+	    }
+	    else
+	    {
+		if ($Getopt::Std::opt_p)
+		{
+		    prune("$target/$file");
+		}
+		else
+		{
+		    message(
+			    tag	=> "CONFLICT",
+			    msg => "$target/$file is linked to something"
+				   . " other than $source/$file"
+				   . " ($target/$file -> $link)",
+			);
+
+		    logger(
+			    tag	=> "DC",
+			    log	=> [ "$target/$file", "invalid symlink" ],
+			) unless $Getopt::Std::opt_n;
+		}
+	    }
+
+	    next;
+	}
+
+	unless (-e "$target/$file")
+	{
+	    unless ($Getopt::Std::opt_p)
+	    {
+		# Target file does not exist - package may not have been
+		# installed correctly or file is in .graft-exclude or
+		# directory has a .nograft file.
+
+		message(
+			tag	=> "NOP",
+			msg	=> "$target/$file does not exist",
+		    ) if $veryVerbose;
+	    }
+
+	    next;
+	}
+
+	if ($Getopt::Std::opt_p)
+	{
+	    prune("$target/$file");
+	}
+	else
+	{
+	    message(
+		    tag	=> "CONFLICT",
+		    msg => "$target/$file already exists but is NOT a"
+			   . " symlink to $source/$file",
+		);
+
+	    logger(
+		    tag	=> "DC",
+		    log	=> [ "$target/$file", "file exists" ],
+		) unless $Getopt::Std::opt_n;
+	}
+    }
+
+    # Recursively descend into this directory and repeat the process.
+
+    foreach my $dir (sort keys %directories)
+    {
+	uninstall(
+		source	=> "$source/$dir",
+		target	=> "$target/$dir",
+	    );
+    }
+
+    return if $Getopt::Std::opt_p;	# No need to do empty directory
+					# check in prune mode
+
+    # Check to see if the target directory is now empty. If so
+    # flag ask the user to manually delete it if so desired. Delete the
+    # directory if $deleteObjects is true.
+
+    if (-d "$target")
+    {
+	unless (chdir $target)
+	{
+	    message(
+		    tag	=> "ERROR",
+		    msg	=> "Could not change directories to $target: $!",
+		);
+
+	    return;
+	}
+
+	%files = files($target);
+	%directories = directories($target);
+
+	unless (scalar keys %files || scalar keys %directories)
+	{
+	    # Don't delete the top most target directory
+
+	    unless ($target eq $targetTop)
+	    {
+		unless ($deleteObjects)
+		{
+		    message(
+			    tag	=> "EMPTY",
+			    msg => "$target/ is now empty. Delete manually"
+				   . " if necessary.",
+			);
+		}
+		else
+		{
+		    message(
+			    tag	=> "RMDIR",
+			    msg	=> "$target/",
+			);
+
+		    unless ($Getopt::Std::opt_n)
+		    {
+
+			unless (chdir "..")
+			{
+			    message(
+				    tag	=> "ERROR",
+				    msg => "Could not change directories"
+					   . " to $target/..: $!",
+				);
+
+			    return;
+			}
+
+			rmdir $target
+			    or message(
+				    tag	=> "ERROR",
+				    msg => "Cannot remove directory"
+					   . " $target: $!",
+				);
+		    }
+		}
+	    }
+	}
+    }
+}
+
+sub usage
+{
+    my $nopriv;
+    my $priv;
+
+    if ($superuser)
+    {
+	$priv = "Requires superuser privileges.";
+	$nopriv = "Does not require superuser privileges.";
+    }
+    else
+    {
+	$priv = "";
+	$nopriv = "";
+    }
+
+    print << "EOF" if $superuser;
+
+$progname: Version $version
+
+Usage:
+  $progname -i [-C] [-P|u] [-l log] [-n] [-v|V] [-s|-t target] package package ...
+  $progname -d [-D] [-u] [-l log] [-n] [-v|V] [-s|-t target] package package ...
+  $progname -p [-D] [-u] [-l log] [-n] [-v|V] [-s|-t target] package package ...
+
+  -i            Install packages. $priv
+                Cannot be used with -d or -p options.
+EOF
+
+    print << "EOF" unless $superuser;
+
+$progname: Version $version
+
+Usage:
+  $progname -i [-C] [-l log] [-n] [-v|V] [-s|-t target] package package ...
+  $progname -d [-D] [-l log] [-n] [-v|V] [-s|-t target] package package ...
+  $progname -p [-D] [-l log] [-n] [-v|V] [-s|-t target] package package ...
+
+  -i            Install packages. $priv
+                Cannot be used with -d or -p options.
+EOF
+
+    if ($neverGraft)
+    {
+	print << "EOF";
+  -C            Disable the automatic exclusion of files and/or
+  		directories that match:
+EOF
+	
+        print "\t\t    ";
+
+	if (scalar @graftNever)
+	{
+	    print join(" ", @graftNever), "\n";
+	}
+	else
+	{
+	    print "*** No file or directoriy names to match ***\n";
+	}
+    }
+    else
+    {
+	print << "EOF";
+  -C            Force the automatic exclusion of files and/or
+  		directories that match:
+EOF
+	
+        print "\t\t    ";
+
+	if (scalar @graftNever)
+	{
+	    print join(" ", @graftNever), "\n";
+	}
+	else
+	{
+	    print "*** No file or directoriy names to match ***\n";
+	}
+    }
+
+    if ($superuser)
+    {
+	if ($preservePermissions)
+	{
+	    print << "EOF";
+  -P            Do not preserve ownership and permissions when creating
+                directories. Can only be used with the -i option.
+                Cannot be used with the -u option.
+EOF
+	}
+	else
+	{
+	print << "EOF";
+  -P            Preserve ownership and permissions when creating
+                directories. Can only be used with the -i option.
+                Cannot be used with the -u option.
+EOF
+	}
+    }
+
+    print << "EOF";
+  -d            Delete packages. $priv
+                Cannot be used with -i or -p options.
+  -p            Prune files that will conflict with the grafting of the
+                named packages. $priv
+                Cannot be used with -d or -i options.
+EOF
+
+    if ($deleteObjects)
+    {
+	print << "EOF";
+  -D            When used with the -d option, do not remove directories
+                made empty by package deletion. When used with the -p
+                option, rename conflicting files or directories to
+                file${prunedSuffix} instead of removing them.
+                Cannot be used with the -i option.
+EOF
+    }
+    else
+    {
+	print << "EOF";
+  -D            When used with the -d option, remove directories made
+                empty by package deletion. When used with the -p
+                option, remove conflicting files or directories
+                instead of renaming them as file${prunedSuffix}. If
+                the directory is not empty it will be renamed as
+                dir${prunedSuffix}. Cannot be used with the -i option.
+EOF
+    }
+
+    print << "EOF" if $superuser;
+  -u            Superuser privileges are not required to install, delete
+                or prune packages. Cannot be used with the -P option.
+EOF
+
+    print << "EOF";
+  -l log        Use the named file as the log file instead of the
+                default log file. The log file name must be fully
+                qualified. The log file is not used if the -n option
+                is also supplied. Default: /usr/local/devel/ANNOTATION/rrichter/local/var/log/graft
+  -n            Print list of operations but do NOT perform them.
+                Automatically implies the very verbose option.
+EOF
+
+    print << "EOF" if $superuser;
+                $nopriv
+EOF
+
+    print << "EOF";
+  -v            Be verbose.
+  -V            Be very verbose.
+  -s            Stow/Depot compatibility mode. Infer the graft target
+                directory from the package installation directory in
+                the manner of Stow and Depot. Cannot be used with the
+                -t option.
+  -t target     Use the named directory as the graft target directory
+                rather than the default target directory. The target
+                directory must be fully qualified. Cannot be used with
+                the -s option. Default: /usr/local/devel/ANNOTATION/rrichter/local
+  package       Operate on the named packages. If the package name is
+                not fully qualified, the default package installation
+                directory will be prepended to the named package.
+                Default: /usr/local/devel/ANNOTATION/rrichter/packages
+EOF
+
+    exit 2;
+}

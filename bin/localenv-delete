@@ -1,0 +1,23 @@
+#!/bin/sh
+# -*- mode: sh; -*-
+# vim: set filetype=sh :
+set -u # no uninitialized
+set -e # exit on error ( use "|| true" or wrap in "set +e" "set -e" to block )
+set -o pipefail # also exit if error in piped command -- must disable for acceptable errors
+
+env_name=$1
+if [ -z "${LOCALENV_ROOT:-}" ]; then
+    echo "localenv-delete requires an active localenv installation" >&2
+    exit 1
+fi
+if [ "$env_name" = "${LOCALENV_ACTIVE:-}" ]; then
+    echo "Deactivate $env_name before deleting it." >&2
+    echo "What were you thinking?" >&2
+    echo " eval $(localenv deactivate)" >&2
+    exit 2
+fi
+
+perlenv=`$PERLBREW_ROOT/bin/perlbrew list | grep -m 1 "@$env_name$" | sed -e 's/^  *//'`
+$PERLBREW_ROOT/bin/perlbrew lib delete $perlenv
+$ANACONDA_ROOT/bin/conda env remove -y -n $env_name
+rm -rf $LOCALENV_ROOT/envs/$env_name

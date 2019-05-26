@@ -1,0 +1,49 @@
+#!/bin/sh
+# -*- mode: sh; -*-
+# vim: set filetype=sh :
+set -u # no uninitialized
+set -e # exit on error ( use "|| true" or wrap in "set +e" "set -e" to block )
+set -o pipefail # also exit if error in piped command -- must disable for acceptable errors
+IFS=$'\n\t' # spaces don't split items
+bindir=$(cd `dirname $0` && pwd)
+
+usage () {
+    cat <<_USAGE
+Usage: localenv-create <env_name> <python-ver-num> <perl-version>
+Example: localenv-create test 3 perl-5.22.3
+Creates a new local environment named <env_name>, along with associated conda and perlbrew versions
+Note: very rough script; not for general use.
+_USAGE
+}
+
+if [ -z "${LOCALENV_ROOT:-}" ]; then
+    echo "ERROR: localenv not active. Set LOCALENV_ROOT" >&2
+    exit 1
+fi
+
+if [ -n "${LOCALENV_ACTIVE:-}" ]; then
+    echo "ERROR: do not run in an active environment ($LOCALENV_ACTIVE)" >&2
+    exit 1
+fi
+
+conda=$ANACONDA_ROOT/bin/conda
+perlbrew=$PERLBREW_ROOT/bin/perlbrew
+
+env=$1
+python_ver=${2:-3}
+perl_ver=${3:-`$perlbrew list | sed 's/^  *//; s/@.*$//' | sort -u | head -n 1`}
+
+mkdir -p $LOCALENV_ROOT/envs/$1/{bin,lib,share,var/log}
+set +u
+set +e
+set +o pipefail
+$conda create -y -n "$env" python=$python_ver
+$perlbrew lib create $perl_ver@$env
+perlbrew exec --with $perl_ver@$env : >/dev/null  # perlbrew doesn't automatically create the directory
+. $PERLBREW_ROOT/etc/bashrc
+perlbrew use $perl_ver@$env
+set -u
+set -e
+set -o pipefail
+cpanm local::lib
+cpanm Term::ReadLine::Gnu
